@@ -88,7 +88,7 @@ fn parse_args() -> CliArgs {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "figgie-auto [--log-dir DIR] [--seed N] [--max-rounds N] \
+                    "figgie-auto [--log-dir DIR] [--seed N] [--max-rounds N | --games N] \
                      [--round-duration-secs N] [--inter-round-sleep-secs N] \
                      [--deal-warmup-secs N] [--quiet] \
                      [--external-player-cmd CMD] [--opponent NAME]"
@@ -158,7 +158,7 @@ fn main() {
     runtime.block_on(async {
 
         if !cli.quiet {
-            println!("");
+            println!();
             println!("{}|==============================================|{}", CL::DimLightBlue.get(), CL::End.get());
             println!("{}|{}{}           Welcome to Figgie Auto!            {}{}|{}", CL::DimLightBlue.get(), CL::End.get(), CL::Teal.get(), CL::End.get(), CL::DimLightBlue.get(), CL::End.get());
             println!("{}|==============================================|{}\n", CL::DimLightBlue.get(), CL::End.get());
