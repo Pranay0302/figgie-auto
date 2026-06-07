@@ -79,7 +79,7 @@ impl GenericPlayer {
             let diamonds_book = self.diamonds_book.lock().await.clone();
             let hearts_book = self.hearts_book.lock().await.clone();
 
-            println!("{}{:?} | Inventory |:| Spades: {} | Clubs: {} | Diamonds: {} | Hearts: {}{}", CL::Dull.get(), self.name, inventory.spades, inventory.clubs, inventory.diamonds, inventory.hearts, CL::End.get());
+            if self.verbose { println!("{}{:?} | Inventory |:| Spades: {} | Clubs: {} | Diamonds: {} | Hearts: {}{}", CL::Dull.get(), self.name, inventory.spades, inventory.clubs, inventory.diamonds, inventory.hearts, CL::End.get()); }
 
             // with the above information, we can now decide what to do
             // core logic goes here (examples below)
@@ -199,14 +199,14 @@ impl GenericPlayer {
             true => {
                 let price = rng.gen_range(1..15);
                 if current_inventory < 4 {
-                    println!("NOISY |:| BUY | Random card: {:?} | Price: {}", random_card, price);
+                    if self.verbose { println!("NOISY |:| BUY | Random card: {:?} | Price: {}", random_card, price); }
                     self.send_order(price, Direction::Buy, &random_card, &book).await;
                 }
             },
             false => {
                 let price = rng.gen_range(1..15);
                 if current_inventory > 0 {
-                    println!("NOISY |:| SELL | Random card: {:?} | Price: {} | current_inventory: {}", random_card, price, current_inventory);
+                    if self.verbose { println!("NOISY |:| SELL | Random card: {:?} | Price: {} | current_inventory: {}", random_card, price, current_inventory); }
                     self.send_order(price, Direction::Sell, &random_card, &book).await;
                 }
             }

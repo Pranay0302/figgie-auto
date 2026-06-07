@@ -104,7 +104,7 @@ impl EventDrivenPlayer {
                     }
                 }
             } else {
-                println!("{}[!] {:?} |:| Event receiver dropped{}", CL::Red.get(), self.name, CL::End.get());
+                if self.verbose { println!("{}[!] {:?} |:| Event receiver dropped{}", CL::Red.get(), self.name, CL::End.get()); }
             }
         }
     }

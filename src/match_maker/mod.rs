@@ -1,11 +1,22 @@
 use super::{Card, Book, Inventory, Order, Event, Update, Trade, Direction, CL, PlayerName};
+use super::EventLogger;
+use crate::player::external::{SidecarMsg, card_to_suit, player_name_to_str};
 use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use rand::prelude::SliceRandom;
 use kanal::AsyncReceiver;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::path::PathBuf;
 use std::sync::Arc;
 use rand::Rng;
+
+// Gate all output on self.quiet without touching every call site.
+macro_rules! qprintln {
+    ($quiet:expr, $($arg:tt)*) => {
+        if !$quiet { println!($($arg)*); }
+    };
+}
 use std::collections::HashMap;
 
 pub struct MatchMaker {
@@ -20,6 +31,14 @@ pub struct MatchMaker {
     pub event_sender: Sender<Event>,
     pub order_receiver: Arc<AsyncReceiver<Order>>,
     pub rng: StdRng,
+    pub base_seed: u64,
+    pub log_dir: Option<PathBuf>,
+    pub max_rounds: Option<u32>,
+    pub round_duration_secs: u64,
+    pub inter_round_sleep_secs: u64,
+    pub deal_warmup_secs: u64,
+    pub quiet: bool,
+    pub sidecar_tx: Option<UnboundedSender<SidecarMsg>>,
 }
 
 impl MatchMaker {
@@ -28,6 +47,14 @@ impl MatchMaker {
         player_names: Vec<PlayerName>,
         event_sender: Sender<Event>,
         order_receiver: Arc<AsyncReceiver<Order>>,
+        seed: u64,
+        log_dir: Option<PathBuf>,
+        max_rounds: Option<u32>,
+        round_duration_secs: u64,
+        inter_round_sleep_secs: u64,
+        deal_warmup_secs: u64,
+        quiet: bool,
+        sidecar_tx: Option<UnboundedSender<SidecarMsg>>,
     ) -> Self {
 
         let mut player_inventories = HashMap::new();
@@ -55,7 +82,15 @@ impl MatchMaker {
             player_inventories,
             event_sender,
             order_receiver,
-            rng: StdRng::from_entropy(),
+            rng: StdRng::seed_from_u64(seed),
+            base_seed: seed,
+            log_dir,
+            max_rounds,
+            round_duration_secs,
+            inter_round_sleep_secs,
+            deal_warmup_secs,
+            quiet,
+            sidecar_tx,
         }
     }
 
@@ -72,27 +107,27 @@ impl MatchMaker {
         
         let mut starting_inventory = HashMap::new();
 
-        println!("=---= Card Count =---=");
-        println!("{} - {:?} | 12x{}", CL::Dull.get(), self.common_suit, CL::End.get());
+        qprintln!(self.quiet, "=---= Card Count =---=");
+        qprintln!(self.quiet, "{} - {:?} | 12x{}", CL::Dull.get(), self.common_suit, CL::End.get());
         starting_inventory.insert(self.common_suit.clone(), 12);
 
         // randomly pick one of the other 3 suits to be the one with 8 cards
         let mut already_lucky = false;
         for (idx, suit) in [suit_1, suit_2, goal_suit].iter().enumerate() {
-            let lucky_eight = rand::random::<bool>();
+            let lucky_eight: bool = self.rng.gen();
             if idx == 2 && !already_lucky {
                 for _ in 0..8 { cards.push(suit.clone()) }
-                println!("{} - {:?} | 8x{}", CL::Dull.get(), suit, CL::End.get());
+                qprintln!(self.quiet, "{} - {:?} | 8x{}", CL::Dull.get(), suit, CL::End.get());
                 starting_inventory.insert(suit.clone(), 8);
             } else {
                 if !already_lucky && lucky_eight {
                     for _ in 0..8 { cards.push(suit.clone()) }
-                    println!("{} - {:?} | 8x{}", CL::Dull.get(), suit, CL::End.get());
+                    qprintln!(self.quiet, "{} - {:?} | 8x{}", CL::Dull.get(), suit, CL::End.get());
                     starting_inventory.insert(suit.clone(), 8);
                     already_lucky = true;
                 } else {
                     for _ in 0..10 { cards.push(suit.clone()) }
-                    println!("{} - {:?} | 10x{}", CL::Dull.get(), suit, CL::End.get());
+                    qprintln!(self.quiet, "{} - {:?} | 10x{}", CL::Dull.get(), suit, CL::End.get());
                     starting_inventory.insert(suit.clone(), 10);
                 }
             }
@@ -115,24 +150,37 @@ impl MatchMaker {
 
 
     pub async fn start(&mut self) {
-        let round_duration = tokio::time::Duration::from_secs(60 * 4); // 4 minutes per round
+        let round_duration = tokio::time::Duration::from_secs(self.round_duration_secs);
 
         loop {
+            // game_id for the file we'll write this round; mixes seed and round
+            // so concurrent runs with different seeds don't collide on disk.
+            let game_id: u64 = self.base_seed.wrapping_add(self.round as u64);
+            let logger: Option<Arc<EventLogger>> = self.log_dir.as_ref().and_then(|dir| {
+                match EventLogger::new(dir, game_id, self.base_seed) {
+                    Ok(l) => Some(Arc::new(l)),
+                    Err(e) => {
+                        eprintln!("[!] failed to open event log: {:?}", e);
+                        None
+                    }
+                }
+            });
+
             let mut pot = 0;
             let ante = 200 / self.player_names.len();
 
-            println!("{}==================== ROUND {} ===================={}", CL::Purple.get(), self.round, CL::End.get());
-            println!("");
-            println!("=---= Game Details =---=");
-            println!("{} - Players: {}x{}", CL::Dull.get(), self.player_names.len(), CL::End.get());
-            println!("{} - Ante: {}{}", CL::Dull.get(), ante, CL::End.get());
-            println!("{} - Pot: 200{}", CL::Dull.get(), CL::End.get());
-            println!("");
+            qprintln!(self.quiet, "{}==================== ROUND {} ===================={}", CL::Purple.get(), self.round, CL::End.get());
+            qprintln!(self.quiet, "");
+            qprintln!(self.quiet, "=---= Game Details =---=");
+            qprintln!(self.quiet, "{} - Players: {}x{}", CL::Dull.get(), self.player_names.len(), CL::End.get());
+            qprintln!(self.quiet, "{} - Ante: {}{}", CL::Dull.get(), ante, CL::End.get());
+            qprintln!(self.quiet, "{} - Pot: 200{}", CL::Dull.get(), CL::End.get());
+            qprintln!(self.quiet, "");
             
             let initial_points = self.player_points.clone();
             for (player, points) in self.player_points.iter_mut() {
                 if *points < ante {
-                    println!("[!] Player {:?} does not have enough points to play", player);
+                    qprintln!(self.quiet, "[!] Player {:?} does not have enough points to play", player);
                     break;
                 }
                 *points -= ante;
@@ -142,16 +190,42 @@ impl MatchMaker {
             self.pick_new_common_suit();
             let starting_inventory = self.get_new_inventories();
 
-            println!("{} - Common suit: {:?}{}", CL::Dull.get(), self.common_suit, CL::End.get());
-            println!("{} - Goal suit: {}{:?}{}{}", CL::Dull.get(), CL::LimeGreen.get(), self.goal_suit, CL::End.get(), CL::End.get());
-            println!("");
+            qprintln!(self.quiet, "{} - Common suit: {:?}{}", CL::Dull.get(), self.common_suit, CL::End.get());
+            qprintln!(self.quiet, "{} - Goal suit: {}{:?}{}{}", CL::Dull.get(), CL::LimeGreen.get(), self.goal_suit, CL::End.get(), CL::End.get());
+            qprintln!(self.quiet, "");
 
-            println!("{}[+] Dealing cards...{}\n", CL::DimLightBlue.get(), CL::End.get());
-            
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await; // give the players a little bit to get ready
+            qprintln!(self.quiet, "{}[+] Dealing cards...{}\n", CL::DimLightBlue.get(), CL::End.get());
+
+            // Log round_start + deal with full ground truth. t=0 marks dealing.
+            if let Some(l) = &logger {
+                l.log_round_start(0.0, self.round, ante, pot, &self.player_names);
+                l.log_deal(
+                    0.0,
+                    &self.player_names,
+                    &self.player_inventories,
+                    &self.common_suit,
+                    &self.goal_suit,
+                    &starting_inventory,
+                );
+            }
+            if let Some(tx) = &self.sidecar_tx {
+                let names: Vec<String> = self.player_names.iter()
+                    .map(|p| player_name_to_str(p).to_string())
+                    .collect();
+                let _ = tx.send(SidecarMsg::RoundStart { players: names, bot_index: 0 });
+                let inv = self.player_inventories
+                    .get(&self.player_names[0])
+                    .copied()
+                    .unwrap_or_else(Inventory::new);
+                let _ = tx.send(SidecarMsg::Deal {
+                    s: inv.spades, c: inv.clubs, h: inv.hearts, d: inv.diamonds,
+                });
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(self.deal_warmup_secs)).await; // give the players a little bit to get ready
             
             if let Err(e) = self.event_sender.send(Event::DealCards(self.player_inventories.clone())) {
-                println!("{}[!] Error sending deal cards event: {:?}{}", CL::Red.get(), e, CL::End.get());
+                qprintln!(self.quiet, "{}[!] Error sending deal cards event: {:?}{}", CL::Red.get(), e, CL::End.get());
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // give the players some time to order their cards
@@ -165,7 +239,7 @@ impl MatchMaker {
                 trade: None,
             });
             if let Err(e) = self.event_sender.send(book_event) {
-                println!("[!] Error sending book event: {:?}", e);
+                qprintln!(self.quiet, "[!] Error sending book event: {:?}", e);
             }
 
             let (spades_color, clubs_color, diamonds_color, hearts_color) = self.goal_suit.get_book_colors();
@@ -173,18 +247,23 @@ impl MatchMaker {
             let start = tokio::time::Instant::now();
             while start.elapsed() < round_duration {
 
-                if let Ok(order) = self.order_receiver.recv().await {
+                // Bound the recv by the time left in the round so a quiet
+                // order channel can't keep the round alive past its duration.
+                let remaining = round_duration.saturating_sub(start.elapsed());
+                let recv_result = tokio::time::timeout(remaining, self.order_receiver.recv()).await;
+                if let Ok(Ok(order)) = recv_result {
                     if order.price == 0 { // No free lunches allowed
                         continue;
                     }
+                    let t_now = start.elapsed().as_secs_f64();
 
-                    println!("Processing order: {:?} | Queue: {}x", order, self.order_receiver.len());
+                    qprintln!(self.quiet, "Processing order: {:?} | Queue: {}x", order, self.order_receiver.len());
 
                     let book = self.books.get_mut(&order.card).unwrap();
                     let trade: Option<Trade> = match order.direction {
                         Direction::Buy => {
                             if order.price >= book.ask.price {
-                                println!("{}[-] Aggressing Player: {:?} | {:?} |:| Matched buy order!{}", CL::Green.get(), order.player_name, order.card, CL::End.get());
+                                qprintln!(self.quiet, "{}[-] Aggressing Player: {:?} | {:?} |:| Matched buy order!{}", CL::Green.get(), order.player_name, order.card, CL::End.get());
 
 
                                 // =-= Update the Inventories =-= //
@@ -218,7 +297,18 @@ impl MatchMaker {
                                 if order.price > book.bid.price {
                                     // update the bid price and user_id
                                     book.bid.price = order.price;
-                                    book.bid.player_name = order.player_name;
+                                    book.bid.player_name = order.player_name.clone();
+                                    if let Some(l) = &logger {
+                                        l.log_quote(t_now, "bid", &order.player_name, &order.card, order.price);
+                                    }
+                                    if let Some(tx) = &self.sidecar_tx {
+                                        let _ = tx.send(SidecarMsg::Quote {
+                                            side:   "bid",
+                                            player: player_name_to_str(&order.player_name).to_string(),
+                                            suit:   card_to_suit(&order.card),
+                                            price:  order.price,
+                                        });
+                                    }
                                 }
                                 None
                             }
@@ -227,12 +317,15 @@ impl MatchMaker {
                             // check if the user has the inventory to sell this Card
                             let seller_inventory = self.player_inventories.get(&order.player_name).unwrap();
                             if seller_inventory.get(&order.card) == 0 {
-                                println!("[!] {:?} | {:?} |:| Player does not have the inventory to sell this Card", order.player_name, order.card);
+                                qprintln!(self.quiet, "[!] {:?} | {:?} |:| Player does not have the inventory to sell this Card", order.player_name, order.card);
+                                if let Some(l) = &logger {
+                                    l.log_order_rejected(t_now, &order.player_name, &order.card, "no_inventory");
+                                }
                                 continue;
                             }
 
                             if order.price <= book.bid.price {
-                                println!("{}[-] Aggressing Player: {:?} | {:?} |:| Matched sell order!{}", CL::Red.get(), order.player_name, order.card, CL::End.get());
+                                qprintln!(self.quiet, "{}[-] Aggressing Player: {:?} | {:?} |:| Matched sell order!{}", CL::Red.get(), order.player_name, order.card, CL::End.get());
 
                                 // =-= Update the Inventories =-= //
                                 let buyer_inventory = self.player_inventories.get_mut(&book.bid.player_name).unwrap();
@@ -261,17 +354,43 @@ impl MatchMaker {
                                 Some(trade)
 
                             } else {
-                                // check if this price beats the current best bid
+                                // check if this price beats the current best ask
                                 if order.price < book.ask.price {
-                                    // update the bid price and user_id
+                                    // update the ask price and user_id
                                     book.ask.price = order.price;
-                                    book.ask.player_name = order.player_name;
+                                    book.ask.player_name = order.player_name.clone();
+                                    if let Some(l) = &logger {
+                                        l.log_quote(t_now, "offer", &order.player_name, &order.card, order.price);
+                                    }
+                                    if let Some(tx) = &self.sidecar_tx {
+                                        let _ = tx.send(SidecarMsg::Quote {
+                                            side:   "offer",
+                                            player: player_name_to_str(&order.player_name).to_string(),
+                                            suit:   card_to_suit(&order.card),
+                                            price:  order.price,
+                                        });
+                                    }
                                 }
                                 None
                             }
                         },
                     };
 
+                    if let Some(tr) = trade.clone() {
+                        if let Some(l) = &logger {
+                            l.log_trade(t_now, &tr.card, tr.price, &tr.buyer, &tr.seller);
+                            l.log_cancel_all(t_now);
+                        }
+                        if let Some(tx) = &self.sidecar_tx {
+                            let _ = tx.send(SidecarMsg::TradeExec {
+                                suit:   card_to_suit(&tr.card),
+                                price:  tr.price,
+                                buyer:  player_name_to_str(&tr.buyer).to_string(),
+                                seller: player_name_to_str(&tr.seller).to_string(),
+                            });
+                            let _ = tx.send(SidecarMsg::CancelAll);
+                        }
+                    }
                     if let Some(_) = trade.clone() {
                         // =-= Reset all the Books =-= //
                         self.books.get_mut(&Card::Spade).unwrap().reset_quotes();
@@ -287,16 +406,16 @@ impl MatchMaker {
                     }
 
                     // =-= Print the Game =-= //
-                    println!("\n=---------------------------------------------------------------------------------=");
+                    qprintln!(self.quiet, "\n=---------------------------------------------------------------------------------=");
 
                     let spades = self.books.get(&Card::Spade).unwrap();
                     let clubs = self.books.get(&Card::Club).unwrap();
                     let diamonds = self.books.get(&Card::Diamond).unwrap();
                     let hearts = self.books.get(&Card::Heart).unwrap();
-                    println!("{}Spades    {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", spades_color.get(), CL::Dull.get(), CL::Green.get(), spades.bid.price,    CL::Dull.get(), spades.bid.player_name,    CL::PeachRed.get(),  spades.ask.price,    CL::Dull.get(),  spades.ask.player_name,    CL::Dull.get(),  CL::DimLightBlue.get(),  spades.last_trade.unwrap_or_default(),    CL::End.get());
-                    println!("{}Clubs     {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", clubs_color.get(), CL::Dull.get(), CL::Green.get(), clubs.bid.price,     CL::Dull.get(), clubs.bid.player_name,     CL::PeachRed.get(),  clubs.ask.price,     CL::Dull.get(),  clubs.ask.player_name,     CL::Dull.get(),  CL::DimLightBlue.get(),  clubs.last_trade.unwrap_or_default(),     CL::End.get());
-                    println!("{}Diamonds  {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", diamonds_color.get(), CL::Dull.get(), CL::Green.get(), diamonds.bid.price,  CL::Dull.get(), diamonds.bid.player_name,  CL::PeachRed.get(),  diamonds.ask.price,  CL::Dull.get(),  diamonds.ask.player_name,  CL::Dull.get(),  CL::DimLightBlue.get(),  diamonds.last_trade.unwrap_or_default(),  CL::End.get());
-                    println!("{}Hearts    {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", hearts_color.get(), CL::Dull.get(), CL::Green.get(), hearts.bid.price,    CL::Dull.get(), hearts.bid.player_name,    CL::PeachRed.get(),  hearts.ask.price,    CL::Dull.get(),  hearts.ask.player_name,    CL::Dull.get(),  CL::DimLightBlue.get(),  hearts.last_trade.unwrap_or_default(),    CL::End.get());
+                    qprintln!(self.quiet, "{}Spades    {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", spades_color.get(), CL::Dull.get(), CL::Green.get(), spades.bid.price,    CL::Dull.get(), spades.bid.player_name,    CL::PeachRed.get(),  spades.ask.price,    CL::Dull.get(),  spades.ask.player_name,    CL::Dull.get(),  CL::DimLightBlue.get(),  spades.last_trade.unwrap_or_default(),    CL::End.get());
+                    qprintln!(self.quiet, "{}Clubs     {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", clubs_color.get(), CL::Dull.get(), CL::Green.get(), clubs.bid.price,     CL::Dull.get(), clubs.bid.player_name,     CL::PeachRed.get(),  clubs.ask.price,     CL::Dull.get(),  clubs.ask.player_name,     CL::Dull.get(),  CL::DimLightBlue.get(),  clubs.last_trade.unwrap_or_default(),     CL::End.get());
+                    qprintln!(self.quiet, "{}Diamonds  {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", diamonds_color.get(), CL::Dull.get(), CL::Green.get(), diamonds.bid.price,  CL::Dull.get(), diamonds.bid.player_name,  CL::PeachRed.get(),  diamonds.ask.price,  CL::Dull.get(),  diamonds.ask.player_name,  CL::Dull.get(),  CL::DimLightBlue.get(),  diamonds.last_trade.unwrap_or_default(),  CL::End.get());
+                    qprintln!(self.quiet, "{}Hearts    {}|:| Bid: ({}{:?}{}, {:?}) | Ask: ({}{:?}{}, {:?}) |:|{} Last trade: {}{:?}{}", hearts_color.get(), CL::Dull.get(), CL::Green.get(), hearts.bid.price,    CL::Dull.get(), hearts.bid.player_name,    CL::PeachRed.get(),  hearts.ask.price,    CL::Dull.get(),  hearts.ask.player_name,    CL::Dull.get(),  CL::DimLightBlue.get(),  hearts.last_trade.unwrap_or_default(),    CL::End.get());
                     
                     let mut inventory_string = format!("{}Points    {}|:|{} ", CL::DullGreen.get(), CL::Dull.get(), CL::DullGreen.get());
                     for player_name in &self.player_names {
@@ -305,8 +424,8 @@ impl MatchMaker {
                     }
                     inventory_string.truncate(inventory_string.len() - 3);
 
-                    println!("{}{}", inventory_string, CL::End.get());
-                    println!("=---------------------------------------------------------------------------------=\n");
+                    qprintln!(self.quiet, "{}{}", inventory_string, CL::End.get());
+                    qprintln!(self.quiet, "=---------------------------------------------------------------------------------=\n");
 
                     let update = Update {
                         spades: self.books.get(&Card::Spade).unwrap().clone(),
@@ -317,10 +436,10 @@ impl MatchMaker {
                     };
                     let update_event = Event::Update(update);
 
-                    //println!("{}[+] Done processing request{}", CL::Green.get(), CL::End.get());
+                    //qprintln!(self.quiet, "{}[+] Done processing request{}", CL::Green.get(), CL::End.get());
 
                     if let Err(e) = self.event_sender.send(update_event) {
-                        println!("[!] Error sending update event: {:?}", e);
+                        qprintln!(self.quiet, "[!] Error sending update event: {:?}", e);
                     }
                 }
             } 
@@ -328,27 +447,27 @@ impl MatchMaker {
             // =-= End the Round =-= //
             let end_round = Event::EndRound;
             if let Err(e) = self.event_sender.send(end_round) {
-                println!("[!] Error sending end round event: {:?}", e);
+                qprintln!(self.quiet, "[!] Error sending end round event: {:?}", e);
             }
 
-            println!("");
-            println!("{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
-            println!("{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Round over! =-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
-            println!("{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
-            println!("");
+            qprintln!(self.quiet, "");
+            qprintln!(self.quiet, "{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
+            qprintln!(self.quiet, "{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Round over! =-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
+            qprintln!(self.quiet, "{}=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-={}", CL::Pink.get(), CL::End.get());
+            qprintln!(self.quiet, "");
             
-            println!("=---= Game Details =---=");
-            println!("{} - Players: {}x{}", CL::Dull.get(), self.player_names.len(), CL::End.get());
-            println!("{} - Ante: {}{}", CL::Dull.get(), ante, CL::End.get());
-            println!("{} - Pot: {}{}", CL::Dull.get(), pot, CL::End.get());
-            println!("");
-            println!("=---= Card Count =---=");
+            qprintln!(self.quiet, "=---= Game Details =---=");
+            qprintln!(self.quiet, "{} - Players: {}x{}", CL::Dull.get(), self.player_names.len(), CL::End.get());
+            qprintln!(self.quiet, "{} - Ante: {}{}", CL::Dull.get(), ante, CL::End.get());
+            qprintln!(self.quiet, "{} - Pot: {}{}", CL::Dull.get(), pot, CL::End.get());
+            qprintln!(self.quiet, "");
+            qprintln!(self.quiet, "=---= Card Count =---=");
             for (suit, amount) in starting_inventory {
-                println!("{} - {:?} | {}x{}", CL::Dull.get(), suit, amount, CL::End.get());
+                qprintln!(self.quiet, "{} - {:?} | {}x{}", CL::Dull.get(), suit, amount, CL::End.get());
             }
-            println!("{} - Common suit: {:?}{}", CL::Dull.get(), self.common_suit, CL::End.get());
-            println!("{} - Goal suit: {}{:?}{}{}", CL::Dull.get(), CL::LimeGreen.get(), self.goal_suit, CL::End.get(), CL::End.get());
-            println!("");
+            qprintln!(self.quiet, "{} - Common suit: {:?}{}", CL::Dull.get(), self.common_suit, CL::End.get());
+            qprintln!(self.quiet, "{} - Goal suit: {}{:?}{}{}", CL::Dull.get(), CL::LimeGreen.get(), self.goal_suit, CL::End.get(), CL::End.get());
+            qprintln!(self.quiet, "");
 
             self.round += 1;
 
@@ -359,7 +478,7 @@ impl MatchMaker {
             let mut winner: (PlayerName, usize) = (PlayerName::None, 0); // player_id, goal_cards
             let mut tied_winnders: Vec<PlayerName> = Vec::new(); // player_ids
 
-            println!("=---------------------------- Inventory ----------------------------=");
+            qprintln!(self.quiet, "=---------------------------- Inventory ----------------------------=");
             for player_name in &self.player_names {
                 let inventory = self.player_inventories.get(player_name).unwrap();
                 let player_points = self.player_points.get_mut(player_name).unwrap();
@@ -377,7 +496,7 @@ impl MatchMaker {
                     Card::Heart => (CL::Dull.get(), CL::Dull.get(), CL::Dull.get(), CL::LimeGreen.get()),
                 };
 
-                println!("{}{}{:?}{} |:| Spades: {}{}x{} | Clubs: {}{}x{} | Diamonds: {}{}x{} | Hearts: {}{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), player_name, CL::Dull.get(), spade_color, inventory.spades, CL::Dull.get(), club_color, inventory.clubs, CL::Dull.get(), diamond_color, inventory.diamonds, CL::Dull.get(), heart_color, inventory.hearts, CL::End.get(), CL::End.get());
+                qprintln!(self.quiet, "{}{}{:?}{} |:| Spades: {}{}x{} | Clubs: {}{}x{} | Diamonds: {}{}x{} | Hearts: {}{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), player_name, CL::Dull.get(), spade_color, inventory.spades, CL::Dull.get(), club_color, inventory.clubs, CL::Dull.get(), diamond_color, inventory.diamonds, CL::Dull.get(), heart_color, inventory.hearts, CL::End.get(), CL::End.get());
 
                 if goal_cards >= winner.1 {
                     if goal_cards == winner.1 {
@@ -391,30 +510,30 @@ impl MatchMaker {
                 *player_points += goal_cards * 10;
                 pot -= goal_cards * 10;
             }
-            println!("");
+            qprintln!(self.quiet, "");
 
             // if there's one winner, award them the pot
             // if there's a tie, split the pot evenly between the winners
 
-            println!("=----------------------------- Results -----------------------------=");
+            qprintln!(self.quiet, "=----------------------------- Results -----------------------------=");
             if tied_winnders.is_empty() {
-                println!("{}[+] Player '{:?}' wins the whole pot of {} points{}", CL::Green.get(), winner.0, pot, CL::End.get());
+                qprintln!(self.quiet, "{}[+] Player '{:?}' wins the whole pot of {} points{}", CL::Green.get(), winner.0, pot, CL::End.get());
                 let winner_points = self.player_points.get_mut(&winner.0).unwrap();
                 *winner_points += pot;
             } else {
                 let split = pot / (tied_winnders.len() + 1);
-                println!("{}[+] Players tie for the pot of {} points{}\n", CL::Teal.get(), pot, CL::End.get());
-                println!("{}------ Tied Players ------{}", CL::Dull.get(), CL::End.get());
-                println!("{}{}{:?}{} | Goal Cards: {}x | Points: {}+{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), winner.0, CL::Dull.get(), winner.1, CL::LimeGreen.get(), split, CL::End.get(), CL::End.get());
+                qprintln!(self.quiet, "{}[+] Players tie for the pot of {} points{}\n", CL::Teal.get(), pot, CL::End.get());
+                qprintln!(self.quiet, "{}------ Tied Players ------{}", CL::Dull.get(), CL::End.get());
+                qprintln!(self.quiet, "{}{}{:?}{} | Goal Cards: {}x | Points: {}+{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), winner.0, CL::Dull.get(), winner.1, CL::LimeGreen.get(), split, CL::End.get(), CL::End.get());
                 for player_name in tied_winnders {
-                    println!("{}{}{:?}{} | Goal Cards: {}x | Points: {}+{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), player_name, CL::Dull.get(), winner.1, CL::LimeGreen.get(), split, CL::End.get(), CL::End.get());
+                    qprintln!(self.quiet, "{}{}{:?}{} | Goal Cards: {}x | Points: {}+{}x{}{}", CL::Dull.get(), CL::DimLightBlue.get(), player_name, CL::Dull.get(), winner.1, CL::LimeGreen.get(), split, CL::End.get(), CL::End.get());
                     let player_points = self.player_points.get_mut(&player_name).unwrap();
                     *player_points += split;
                 }
             }
-            println!("");
+            qprintln!(self.quiet, "");
 
-            println!("=-------------------------- Updated Points -------------------------=");
+            qprintln!(self.quiet, "=-------------------------- Updated Points -------------------------=");
             let mut inventory_string = String::from("");
             for player_name in &self.player_names {
                 let initial_points = initial_points.get(player_name).unwrap();
@@ -430,10 +549,37 @@ impl MatchMaker {
                 inventory_string += &format!("{:?}: {} {}({}){} | ", player_name, player_points, change_color, point_change, CL::Dull.get());
             }
             inventory_string.truncate(inventory_string.len() - 3);
-            println!("{}{}{}", CL::Dull.get(), inventory_string, CL::End.get());
-            println!("");
+            qprintln!(self.quiet, "{}{}{}", CL::Dull.get(), inventory_string, CL::End.get());
+            qprintln!(self.quiet, "");
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            // Round-end ground truth: final hands + per-player P&L.
+            if let Some(l) = &logger {
+                l.log_round_end(
+                    self.round_duration_secs as f64,
+                    &self.player_names,
+                    &self.goal_suit,
+                    &self.common_suit,
+                    &self.player_inventories,
+                    &initial_points,
+                    &self.player_points,
+                );
+            }
+            if let Some(tx) = &self.sidecar_tx {
+                let _ = tx.send(SidecarMsg::RoundEnd { goal_suit: card_to_suit(&self.goal_suit) });
+            }
+            drop(logger);
+
+            if let Some(max) = self.max_rounds {
+                if self.round >= max {
+                    // Players' tasks are blocked on broadcast::recv, which will
+                    // never unblock cleanly. Exit the process so the smoke test
+                    // and corpus generation terminate.
+                    qprintln!(self.quiet, "[+] reached --max-rounds={}, exiting", max);
+                    std::process::exit(0);
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(self.inter_round_sleep_secs)).await;
 
         }
 

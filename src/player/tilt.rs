@@ -81,7 +81,7 @@ impl TiltInventory {
             let diamonds_book = self.diamonds_book.lock().await.clone();
             let hearts_book = self.hearts_book.lock().await.clone();
 
-            println!("{}{:?} | Inventory |:| Spades: {} | Clubs: {} | Diamonds: {} | Hearts: {}{}", CL::Dull.get(), self.name, inventory.spades, inventory.clubs, inventory.diamonds, inventory.hearts, CL::End.get());
+            if self.verbose { println!("{}{:?} | Inventory |:| Spades: {} | Clubs: {} | Diamonds: {} | Hearts: {}{}", CL::Dull.get(), self.name, inventory.spades, inventory.clubs, inventory.diamonds, inventory.hearts, CL::End.get()); }
 
             // only buy lowest card we were dealt and aggressively sell everything else
             let goal_suit = self.highest_card.lock().await.clone();
